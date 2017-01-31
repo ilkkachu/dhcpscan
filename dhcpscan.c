@@ -1,3 +1,27 @@
+/*
+   dhcpscan - a tool for detecting DHCP servers in a network
+   
+   Copyright (c) 2016 Ilkka Virta <itvirta@iki.fi>
+ 
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License version 2 as published by
+   the Free Software Foundation.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+   
+   The full text of the license is available in the file gpl-2.0.txt, 
+   and also at:
+   https://www.gnu.org/licenses/gpl-2.0.txt
+   
+   The SHA-256 hash of gpl-2.0.txt is 
+   8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643  gpl-2.0.txt
+
+ */
+
+
 #define _GNU_SOURCE 1
 
 #include <stdio.h>
@@ -28,8 +52,11 @@
 
 
 #define PROG_NAME "dhcpscan"
-#define PROG_VER  "0.1"
+#define PROG_VER  "0.1.1"
 #define PROG_COPYRIGHT "Copyright (c) 2016 Ilkka Virta <itvirta@iki.fi>"
+
+
+#define LISTEN_TO_REQUESTS 0
 
 /* 
  * DHCP scanner
@@ -37,19 +64,24 @@
  * TODO:
  *   x build and send dhcp requests to fish for replies
  *        x find mac address of interface to use 
- *   - check xid and chaddr on replies ? 
  *   x clean up output and debug output
  *       (interesting packets (always), init/send/listen cycle, 
  *        all received packets + checks, packets with hexdumps)
  *   x add interface and timestamp to printed report
  *   x handle command line args properly (getopt)
  *        interface to listen, timeout?, known DHCP servers? output debuglevel
- *   - allow ignoring known DHCP servers (IP, ether, both?)
+ *   x allow ignoring known DHCP servers (IP, ether, both?)
  *   x drop privileges 
- *   - settable source ethernet address?
- *   - allow saving received packets?
+ *   - check xid and chaddr on replies? (not really necessary)
+ *
  *   - add switch for listening on dhcp requests, too.
  *   - add possibility to send an email or run a program on match
+ * 
+ *   x settable source ethernet address?
+ *   - support long options?
+ *   - allow saving received packets? (as hexdump or pcap)
+ *
+ *   - send DHCPREQUEST queries too
  */
 
 
@@ -97,23 +129,27 @@ struct dhcp_reply {
 };
 
 /* arbitrary limit, but simplifies the memory management (the joys of C programming) */
-#define MAX_KNOWN_SERVERS 6
+#define MAX_KNOWN_SERVERS 8
 
 /* global configuration */
 static struct {
 	char *interface;		/* interface to listen on */
 	unsigned verbosity;		/* verbosity level */
 	uint32_t xid;			/* DHCP transaction ID */
-	struct ether_addr my_ether;	/* my ethernet hardware address */
+	struct ether_addr src_ether;	/* ethernet source hardware address */
+	unsigned src_ether_set;		/* ethernet source address was manually set */
 	unsigned scantime;		/* time to listen for replies, in seconds */
 	unsigned listenonly;		/* listen only, don't send any queries */
 	unsigned broadcast;		/* set broadcast flag on outgoing queries */
 	unsigned quiet;			/* quiet mode, don't print caught replies */
+					/* servers "known" to us, they will not be reported on */	
 	struct ether_addr known_servers[MAX_KNOWN_SERVERS];
 	unsigned known_servers_count;
-					/* servers "known" to us, they will not be reported on */
-//	const char *mailto;		/* email address to send a message to when a reply caught - not implemented */
-//	const char *commmand;		/* command to run when a reply caught                     - not implemented */
+
+#if 0
+	const char *mailto;		/* email address to send a message to when a reply caught - not implemented */
+	const char *commmand;		/* command to run when a reply caught                     - not implemented */
+#endif
 	
 } config;
 
@@ -210,11 +246,11 @@ struct bootp *build_dhcp_request(void)
 	/* DHCP options we send in the query
 	 */
 	uint8_t dhcp_options[BOOTP_OPTIONS_LEN] = 
-	   "\x63\x82\x53\x63" 		// DHCP magic cookie
-	   "\x35\x01\x01"		// DHCP type 1 = discover
-	   "\x3d\x07\x01"		// DHCP client id
-	   "\x00\x00\x00\x00\x00\x00" 	// * placeholder for actual Ethernet address *
-	   "\xff";			// end of options
+	   "\x63\x82\x53\x63" 		/* DHCP magic cookie */
+	   "\x35\x01\x01"		/* DHCP type 1 = discover */
+	   "\x3d\x07\x01"		/* DHCP client id */
+	   "\x00\x00\x00\x00\x00\x00" 	/* * placeholder for actual Ethernet address * */
+	   "\xff";			/* end of options */
 	
 	const unsigned dhcp_options_len = sizeof(dhcp_options);
 
@@ -238,7 +274,7 @@ struct bootp *build_dhcp_request(void)
 	bp->bootp_giaddr = zero_addr;
 
 	memset(bp->bootp_chaddr, 0, BOOTP_CHADDR_LEN);
-	memcpy(bp->bootp_chaddr, config.my_ether.ether_addr_octet, ETH_ALEN);
+	memcpy(bp->bootp_chaddr, config.src_ether.ether_addr_octet, ETH_ALEN);
 	memset(bp->bootp_sname, 0, BOOTP_SNAME_LEN);
 	memset(bp->bootp_file,  0, BOOTP_FILE_LEN);
 	memset(bp->bootp_sname, 0, BOOTP_SNAME_LEN);
@@ -250,7 +286,7 @@ struct bootp *build_dhcp_request(void)
 		fprintf(stderr, "Err, can't find the location of client hw address option, look in build_dhcp_request() and fix this\n");
 		abort();
 	}
-	memcpy(dhcp_opt_chaddr + 3, config.my_ether.ether_addr_octet, ETH_ALEN);
+	memcpy(dhcp_opt_chaddr + 3, config.src_ether.ether_addr_octet, ETH_ALEN);
 
 	memcpy(bp->bootp_options, dhcp_options, dhcp_options_len);
 
@@ -360,7 +396,7 @@ pcap_t *init_pcap(const char *dev, int snaplen, int promisc, int timeout_ms, int
 		return NULL;
 	}
 	if ((ret = pcap_activate(pcap))) {
-		fprintf(stderr, "pcap_activate: %d: %s\n", ret, pcap_geterr(pcap));
+		fprintf(stderr, "pcap_activate: %d: %s%s\n", ret, pcap_geterr(pcap), errno == EPERM ? " (You may need root privileges)" : "");
 		return NULL;
 	}
 	if (pcap_datalink(pcap) != DLT_EN10MB) {
@@ -404,16 +440,24 @@ pcap_t *setup_pcap(const char *dev)
 	int timeout_ms = 1000;
 	int immediate = 1;
 
+#if LISTEN_TO_REQUESTS
+	const char *filter_src = "udp port bootpc";      /* all bootp packets */
+#else
 	const char *filter_src = "udp dst port bootpc";  /* only consider bootp replies */
-	// const char *filter_src = "udp port bootpc";      /* all bootp packets */
+#endif
+
+	/* set to promiscuous mode if we're using a fake source address */
+	if (config.src_ether_set)
+		promisc = 1;
 
 
 	debug(1, "Opening pcap on interface %s\n", dev);
 	debug(2, "  pcap parameters: snaplen %d, promisc %d, timeout %d, immediate %d\n", 
 		snaplen, promisc, timeout_ms, immediate);
 
-	//  pcap_open_live would do everything init_pcap does, except set immediate mode
-	//pcap = pcap_open_live(dev, snaplen, promisc, timeout_ms, errbuf);
+	/*  pcap_open_live would do everything init_pcap does, except set immediate mode
+	 *  pcap = pcap_open_live(dev, snaplen, promisc, timeout_ms, errbuf);
+	 */
 
 	pcap = init_pcap(dev, snaplen, promisc, timeout_ms, immediate);
 	if (pcap == NULL) {
@@ -479,8 +523,6 @@ int parse_dhcp_packet(const uint8_t *packet, unsigned packet_len, struct dhcp_re
 	/* print in parts since ether_to_hex() and inet_ntoa() return pointers to static buffers... */
 	debug(2, "    Ethernet src: %s", ether_to_hex(&ether_src));
 	debug(2, " dst: %s type: 0x%04x\n", ether_to_hex(&ether_dst), ntohs(etherh->ether_type));
-//	debug(2, "    Ethernet src: %s", ether_to_hex((struct ether_addr *) etherh->ether_shost));
-//	debug(2, " dst: %s type: 0x%04x\n", ether_to_hex((struct ether_addr *) etherh->ether_dhost), ntohs(etherh->ether_type));
 	debug(2, "    IP ver: %d ihl: %d proto: %d len: %d", iph->ip_v, iph->ip_hl, iph->ip_p, ntohs(iph->ip_len));
 	debug(2, " src %s",   inet_ntoa(ip_src));
 	debug(2, " dst %s\n", inet_ntoa(ip_dst));
@@ -489,19 +531,19 @@ int parse_dhcp_packet(const uint8_t *packet, unsigned packet_len, struct dhcp_re
 	/* Check that the Ether and IP headers contain values we expect */
 	if (ntohs(etherh->ether_type) != ETHERTYPE_IP) {
 		debug(2, "Ethertype != IP\n");
-		return 1; // Not an IP packet...
+		return 1; /* Not an IP packet... */
 	}
 	if (iph->ip_v != 4  || iph->ip_hl < 5 ||  iph->ip_p != IPPROTO_UDP) {
 		debug(2, "Not UDP or invalid IP header values\n");
-		return 1; // IP header has invalid values, or packet is not an UDP packet
+		return 1; /* IP header has invalid values, or packet is not an UDP packet */
 	}
 	if (iph->ip_len < ipheaderlen + sizeof(struct udphdr)) {
 		debug(2, "IP packet length too short\n");
-		return 1; // IP packet length (in header) too short for a valid UDP packet
+		return 1; /* IP packet length (in header) too short for a valid UDP packet */
 	}
 	if (packet_len < sizeof(struct ether_header) + ipheaderlen + sizeof(struct udphdr)) {
 		debug(2, "Packet too short for an UDP packet\n");
-		return 1; // Captured length of packet is too short to parse it.
+		return 1; /* Captured length of packet is too short to parse it. */
 	}
 
 
@@ -514,9 +556,11 @@ int parse_dhcp_packet(const uint8_t *packet, unsigned packet_len, struct dhcp_re
 	/* Check that the UDP packet contains what we expect 
 	 * and is long enough to hold a DHCP packet */
 	
-	//if (ntohs(udph->uh_dport) != UDP_PORT_BOOTP_CLIENT) {
-	//	return 1; // not destined to a bootp client ...
-	//}
+#if ! LISTEN_TO_REQUESTS
+	if (ntohs(udph->uh_dport) != UDP_PORT_BOOTP_CLIENT) {
+		return 1; /* not destined to a bootp client ... */
+	}
+#endif
 	
 	if (ntohs(udph->uh_ulen) < sizeof(struct udphdr) + DHCP_MIN_LEN) {
 		debug(2, "UDP length too short for DHCP\n");
@@ -547,17 +591,22 @@ int parse_dhcp_packet(const uint8_t *packet, unsigned packet_len, struct dhcp_re
 	debug(2, "    chaddr: %s yiaddr: %s\n",
 	       ether_to_hex(&chaddr), inet_ntoa(bootphdr->bootp_yiaddr));
 
-	if (bootphdr->bootp_op    != BOOTP_OP_REPLY) {
-		debug(2, "    Not a BOOTP reply, maybe a request\n");
-		return 1;
-	}
-	
 	if (bootphdr->bootp_htype != BOOTP_HTYPE_ETHER ||
 	    bootphdr->bootp_hlen  != BOOTP_HLEN_ETHER) {
 		debug(2, "    Wrong BOOTP htype or hlen\n");
 		return 1;
 	}
-	
+
+	if (bootphdr->bootp_op != BOOTP_OP_REPLY && bootphdr->bootp_op != BOOTP_OP_REQUEST)  {
+		debug(2, "    Neither a BOOTP request nor a reply(?)\n");
+		return 1;
+	}
+
+	if (bootphdr->bootp_op  == BOOTP_OP_REQUEST) {
+		debug(2, "    This is a BOOTP request\n");
+		return 1;
+	}
+		
 	/* Collect the actually interesting parts to a struct
 	 */
 	rep->ether_src = ether_src;
@@ -640,7 +689,7 @@ void add_known_server(const char *arg)
 	}
 	struct ether_addr *e = ether_aton(arg);
 	if (! e) {
-		fprintf(stderr, "Invalid server %s\n", arg);
+		fprintf(stderr, "Invalid ethernet address %s\n", arg);
 		exit(1);
 	}
 	memcpy(&config.known_servers[i], e, ETH_ALEN);
@@ -650,17 +699,25 @@ void add_known_server(const char *arg)
 void print_usage(void)
 {
 	printf("%s version %s %s\n", PROG_NAME, PROG_VER, PROG_COPYRIGHT);
-	printf("usage: %s -i <iface> [other args...]\n", PROG_NAME);
-	printf("args: \n");
-	printf("  -h            show help\n");
-//	printf("  -e <cmd>      command to execute when receiving a reply\n");
-	printf("  -i <iface>    interface to listen on (mandatory)\n");
-//	printf("  -m <email>    address to send an email to when receiving a reply \n");
-	printf("  -n            listen only, don't send DHCP queries\n");
-	printf("  -q            quiet mode, don't print even received replies\n");
-	printf("  -s <eth addr> replies from this ethernet address will be ignored\n");
-	printf("  -t <time>     listen time\n");
-	printf("  -v            increase verbosity level, can be used multiple times\n");
+	printf("usage: %s -i <iface> [options...]\n", PROG_NAME);
+	printf("command line options: \n");
+	printf("  -i <iface>      interface to listen on (mandatory)\n");
+	printf("  -h              show help\n");
+	printf("\n");
+/*	printf("  -e <cmd>        command to execute when receiving a reply\n");		 	*/
+/*	printf("  -m <email>      address to send an email to when receiving a reply \n");	*/
+	printf("  -n              listen only, don't send DHCP queries\n");
+	printf("  -q              quiet mode, don't print even received replies\n");
+	printf("  -s <eth addr>   known server, replies from this ethernet address will be ignored\n");
+	printf("  -S <eth addr>   source ethernet address\n");
+	printf("  -t <time>       listen time\n");
+	printf("  -v              increase verbosity level, can be used multiple times\n");
+	printf("\n");
+	printf("Example: %s -i eth4 -s a0:b0:c0:11:22:33 -t 5\n", PROG_NAME);
+	printf("\n");
+	printf("This program comes with no warranty, not even an implied warranty of\n");
+	printf("merchantability or fitness for any particular purpose.\n");
+	printf("The program may be distributed under the terms of the GNU GPL version 2.\n");
 	return;
 }
 
@@ -670,13 +727,14 @@ void print_usage(void)
 int parse_args(int argc, char *argv[])
 {
 	int c;
-	while ((c = getopt(argc, argv, "hi:nqs:t:v")) != -1) {
+	struct ether_addr *e;
+	while ((c = getopt(argc, argv, "hi:nqs:S:t:v")) != -1) {
 		switch(c) {
 		case 'b':
 			config.broadcast = 1;
 			break;
 		case 'e':
-			// config.execute = optarg;
+			/* config.execute = optarg; */
 			break;
 		case 'h':
 			print_usage();
@@ -686,7 +744,7 @@ int parse_args(int argc, char *argv[])
 			config.interface = optarg;
 			break;
 		case 'm':
-			// config.mailto = optarg;
+			/* config.mailto = optarg; */
 			break;
 		case 'n':
 			config.listenonly = 1;
@@ -696,6 +754,16 @@ int parse_args(int argc, char *argv[])
 			break;
 		case 's':
 			add_known_server(optarg);
+			break;
+		case 'S':
+			e  = ether_aton(optarg);
+			if (! e) {
+				fprintf(stderr, "Invalid ethernet address %s\n", optarg);
+				exit(1);
+			}
+			memcpy(&config.src_ether, e, ETH_ALEN);
+			config.src_ether.ether_addr_octet[0] &= ~0x01;  /* clear the broadcast bit */
+			config.src_ether_set = 1;
 			break;
 		case 't':
 			config.scantime = atoi(optarg);
@@ -770,6 +838,8 @@ int main(int argc, char *argv[])
 	config.xid = random();
 	config.listenonly = 0;
 	config.broadcast = 0;
+	config.src_ether_set = 0;
+	config.quiet = 0;
 	
 	parse_args(argc, argv);
 
@@ -781,18 +851,22 @@ int main(int argc, char *argv[])
 	pcap_t *pcap = setup_pcap(config.interface);
 	libnet_t *lnet = init_libnet(config.interface);
 	
-	// libnet_get_hwaddr() returns a structure that's essentially the same, but still distinct
-	// from struct ether_addr. Oh well.
-	memcpy(config.my_ether.ether_addr_octet, libnet_get_hwaddr(lnet)->ether_addr_octet, ETH_ALEN);
+	/* find our Ethernet address */
+	/* libnet_get_hwaddr() returns a structure that's essentially the same, but still distinct
+	   from struct ether_addr. Oh well. */
+	if (! config.src_ether_set) {
+		memcpy(config.src_ether.ether_addr_octet, libnet_get_hwaddr(lnet)->ether_addr_octet, ETH_ALEN);
+	}
 	
 	drop_privileges();
 
-	for (int i = 0 ; i < config.known_servers_count ; i++ ) {
+	int i;
+	for (i = 0 ; i < config.known_servers_count ; i++ ) {
 		debug(1, "Known server #%d: %s\n", i, ether_to_hex(&config.known_servers[i]));
 	}
 
 	if (! config.listenonly) {
-		debug(1, "Sending DHCP query on %s (%s)\n", config.interface, ether_to_hex(&config.my_ether));
+		debug(1, "Sending DHCP query on %s (%s)\n", config.interface, ether_to_hex(&config.src_ether));
 		send_dhcp_packet(lnet);
 	}
 
